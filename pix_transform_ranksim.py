@@ -5,15 +5,10 @@ import torch.optim as optim
 import torch.utils.data
 import sys
 import h5py
-import os
 import matplotlib.pyplot as plt
-import time
-from baselines.baselines import bicubic
-from utils.utils import downsample,align_images
-from utils.plots import plot_result
+from utils.utils import downsample
 import argparse
 import random
-import torch.nn.functional as F
 import copy
 import torch.nn as nn
 if 'ipykernel' in sys.modules:
@@ -118,33 +113,7 @@ class PositionalEncoding2D(nn.Module):
         self.cached_penc = emb[None, :, :, :orig_ch].repeat(tensor.shape[0], 1, 1, 1)
         return self.cached_penc
 
-def extract_sub_patches(data, patch_size = 16):
-    # Extract non-overlapping 16x16 images with a stride of 16
-    
-    num_samples, num_channels, original_height, original_width = data.shape
-
-    # Calculate the number of patches along height and width
-    num_patches_height = original_height // patch_size
-    num_patches_width = original_width // patch_size
-
-    # Initialize an empty list to store the extracted 16x16 images
-    extracted_images = []
-
-    # Iterate through each sample and extract non-overlapping 16x16 images
-    for i in range(num_samples):
-        for h in range(num_patches_height):
-            for w in range(num_patches_width):
-                extracted_image = data[i, :, h*patch_size:(h+1)*patch_size, w*patch_size:(w+1)*patch_size]
-                extracted_images.append(extracted_image)
-
-    # Convert the list of extracted images to a numpy array
-    extracted_images = np.array(extracted_images)
-
-    # The extracted_images array will have a shape of (num_samples * num_patches, num_channels, 16, 16)
-    return extracted_images
-
 def positional_encode(tensor):
-    print(tensor.shape)
     assert tensor.shape[-1] == 3
     p_enc_2d_model = PositionalEncoding2D(3)
     x = tensor.clone()
@@ -152,6 +121,7 @@ def positional_encode(tensor):
     return torch.cat([x,penc_no_sum], dim = -1)
 
 class PixTransformNetPositionalEncoding(nn.Module):
+    """PixTransform with sinusoidal positional encoding replacing spatial coordinates."""
 
     def __init__(self, channels_in=5, kernel_size = 1,weights_regularizer = None):
         super(PixTransformNetPositionalEncoding, self).__init__()
@@ -183,14 +153,13 @@ class PixTransformNetPositionalEncoding(nn.Module):
 
         input_spatial = input[:,self.channels_in-3:,:,:]
         input_color = input[:,0:self.channels_in-3,:,:]
-        #input_spatial = input[:,self.channels_in-2:,:,:]
-        #input_color = input[:,0:self.channels_in-2,:,:]
 
         merged_features = self.spatial_net(input_spatial) + self.color_net(input_color)
         
         return self.head_net(merged_features), merged_features
     
 class PixTransformNet(nn.Module):
+    """PixTransform with spatial coordinate grid (x, y) and color branches."""
 
     def __init__(self, channels_in=5, kernel_size = 1,weights_regularizer = None):
         super(PixTransformNet, self).__init__()
@@ -234,7 +203,7 @@ def bin_image_to_classes(image, num_classes,device):
     bin_edges = torch.linspace(image.min().item(), image.max().item(), num_classes).to(device)
     
     # Apply bucketize to get class indices
-    class_indices = torch.bucketize(image, bin_edges) #- 1
+    class_indices = torch.bucketize(image, bin_edges)
     
     return class_indices.to(device)
 
@@ -242,22 +211,38 @@ def bin_image_to_classes(image, num_classes,device):
 
 # Define the parser
 parser = argparse.ArgumentParser(description="PIXTRANSFORM")
-parser.add_argument("--data_dir", type=str, default="/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.h5", help="Path to the data file (HDF5 format)")
+parser.add_argument("--data_dir", type=str, default="path/to/data.h5", help="Path to the data file (HDF5 format)")
 parser.add_argument("--ranksim_weight", type=float, default=0.3, help="Ranksim Weight")
 parser.add_argument("--positional_encoding", type=int, default=0, help="Positional Encoding")
 parser.add_argument("--index_s", type=int, default=0, help="starting index of samples to predict")
 parser.add_argument("--index_f", type=int, default=1, help="finishing index of samples to predict")
 parser.add_argument("--filename", type=str, default="predictions", help="desired file name")
-parser.add_argument("--ranksim_target", type = str, default = "z_mean", help = "Target of the RankSim") 
+parser.add_argument("--ranksim_target", type = str, default = "source", help = "RankSim target (source, binned_target, segmentation, rich_segmentation, y_pred)")
 parser.add_argument("--lr", type = float, default = 0.001, help = "Learning Rate") 
 parser.add_argument("--batchsize", type = int, default = 32, help = "Batchsize") 
 parser.add_argument("--scaling", type = int, default = 4, help = "Scaling Factor") 
 
 
 
-def pixtransform(data_dir = "/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.h5", 
+def pixtransform(data_dir = "path/to/data.h5",
                  positional_encoding = 0, ranksim_weight = 0, indexes = [0,1],
                  lr = 0.001, batchsize = 32, scaling = 4, ranksim_target = "source"):
+    """Train a PixTransform model per-scene and return refined vegetation height predictions.
+
+    Args:
+        data_dir: Path to HDF5 file with keys 'guide', 'source', 'gee'/'segmentation', 'eval'.
+        positional_encoding: If 1, use sinusoidal positional encoding instead of spatial coordinates.
+        ranksim_weight: Weight for RankSim ranking regularizer. Set to 0 to disable.
+        indexes: List of sample indices to process.
+        lr: Learning rate for Adam optimizer.
+        batchsize: Batch size for training.
+        scaling: Downsampling factor of the coarse source VHM.
+        ranksim_target: Target signal for RankSim ('source', 'binned_target', 'segmentation',
+                        'rich_segmentation', 'y_pred').
+
+    Returns:
+        numpy.ndarray: Array of predicted vegetation height maps, shape (len(indexes), H, W).
+    """
 
     dataset = h5py.File(data_dir) 
     target_imgs = np.array(dataset["eval"]).squeeze()
@@ -265,8 +250,8 @@ def pixtransform(data_dir = "/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.
     source_imgs = np.array(dataset["source"]).squeeze()
     try:
         segmentation_imgs = np.array(dataset["gee"]).squeeze()
-    except:
-        segmentation_imgs = np.array(dataset["segmentation"]).squeeze()        
+    except KeyError:
+        segmentation_imgs = np.array(dataset["segmentation"]).squeeze()
     dataset.close()
 
     params = {
@@ -316,7 +301,6 @@ def pixtransform(data_dir = "/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.
         original_source_img = source_imgs[idx]
         source_img = downsample(original_source_img,params['scaling']) ## downsampled source image
         segmentation_img = mapped_arr[idx] #segmentation_imgs[idx] ## GEE segmentation image with sorted label
-        bicubic_target_img = bicubic(source_img=source_img, scaling_factor=params['scaling'])
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         if len(guide_img.shape) < 3:
@@ -370,7 +354,6 @@ def pixtransform(data_dir = "/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.
         if params["positional_encode"]:
             new_guide = guide_img.reshape(1,-1,hr_height, hr_height).permute(0,2,3,1)
             guide_img = positional_encode(new_guide).permute(0,3,1,2).squeeze()
-            #print("Guide image positional encoded with shape = ",guide_img.shape)
 
         if target_img is not None:
             target_img = torch.from_numpy(target_img).float().to(device)
@@ -492,7 +475,7 @@ def pixtransform(data_dir = "/home/tsoyda/data/super_VHM/4d_sentinel_dropna_gee.
             try:
                 fig = plt.plot(losses)
                 plt.savefig(f"RSW{ranksim_weight}_RST{ranksim_target}_PE{positional_encoding}_LR{lr}_batchsize{batchsize}_scaling{scaling}_samples_{idx}")
-            except:
+            except Exception:
                 pass
     return np.array(predictions)
 
